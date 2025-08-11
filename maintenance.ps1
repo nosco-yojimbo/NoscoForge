@@ -1,82 +1,73 @@
-# RunMaintenance.ps1
-# This is the hosted version that gets downloaded from GitHub
+<#
+.SYNOPSIS
+RunMaintenance.ps1
+Runs DISM and SFC, reports results to Power Automate.
 
-# ===== CONFIG =====
-$flowUri = "https://prod-xxx.logic.azure.com:443/workflows/..."   # Power Automate HTTP endpoint
-$apiKey  = "VerySecretKey123!"                                   # Shared secret header
-# ==================
+This script reads config from:
+  C:\ProgramData\Maintenance\config.json
 
-# Run elevated check (not needed if run as SYSTEM via scheduled task)
-if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Output "This script requires administrator rights."
-    exit 1
+Config.json format example:
+{
+  "flowUri": "https://prod-xxx.logic.azure.com/...",
+  "apiKey": "VerySecretKey123!"
 }
 
-Write-Output "Starting DISM..."
-$dismOutput = & dism.exe /Online /Cleanup-Image /RestoreHealth 2>&1
-$dismExit   = $LASTEXITCODE
+No secrets in this script. Logs are deleted after running.
+#>
 
-Write-Output "Starting SFC..."
-$sfcOutput  = & sfc.exe /scannow 2>&1
-$sfcExit    = $LASTEXITCODE
-
-# Error pattern
+# --- Settings ---
+$InstallDir = "C:\ProgramData\Maintenance"
+$configPath = Join-Path $InstallDir 'config.json'
+$logPath    = Join-Path $InstallDir 'RunMaintenance.log'
 $errPattern = '(?i)error|failed|cannot repair|corrupt|unable|failure'
 
-function Get-LastErrorsFromText {
-    param($textOrLines)
-    ($textOrLines | Select-String -Pattern $errPattern -AllMatches |
-        ForEach-Object { $_.Line }) | Select-Object -Unique -Last 5
+function Log {
+    param([string]$message)
+    $timestamp = (Get-Date).ToString("o")
+    $entry = "$timestamp - $message"
+    Add-Content -Path $logPath -Value $entry
+    Write-Output $message
 }
 
-# Gather DISM errors
-$dismErrors = Get-LastErrorsFromText $dismOutput
-if (-not $dismErrors) {
-    $dismLog = "$env:windir\Logs\DISM\dism.log"
-    if (Test-Path $dismLog) {
-        $dismErrors = Get-LastErrorsFromText (Get-Content $dismLog -Tail 2000)
-    }
-}
-if (-not $dismErrors) { $dismErrors = @() }
-
-# Gather SFC errors
-$sfcErrors = Get-LastErrorsFromText $sfcOutput
-if (-not $sfcErrors) {
-    $cbsLog = "$env:windir\Logs\CBS\CBS.log"
-    if (Test-Path $cbsLog) {
-        $sfcErrors = Get-LastErrorsFromText (Get-Content $cbsLog -Tail 2000)
-    }
-}
-if (-not $sfcErrors) { $sfcErrors = @() }
-
-# Summaries
-$dismSummary = if (($dismExit -eq 0) -and (-not $dismErrors)) { 'Success' } else { 'Failure' }
-$sfcSummary  = if (($sfcExit -eq 0) -and (-not $sfcErrors)) { 'Success' } else { 'Failure' }
-
-# Payload
-$payload = @{
-    computerName = $env:COMPUTERNAME
-    timestamp    = (Get-Date).ToUniversalTime().ToString("o")
-    dism = @{
-        exitCode = [int]$dismExit
-        summary  = $dismSummary
-        errors   = $dismErrors
-    }
-    sfc = @{
-        exitCode = [int]$sfcExit
-        summary  = $sfcSummary
-        errors   = $sfcErrors
-    }
+# --- Load config ---
+if (-not (Test-Path $configPath)) {
+    Write-Error "Missing config.json at $configPath. Aborting."
+    exit 2
 }
 
-$body = $payload | ConvertTo-Json -Depth 6
-
-# Post to Power Automate
 try {
-    $headers = @{ 'x-api-key' = $apiKey }
-    Invoke-RestMethod -Uri $flowUri -Method Post -Headers $headers -Body $body -ContentType 'application/json'
-    Write-Output "Report sent successfully."
+    $config = Get-Content $configPath -Raw | ConvertFrom-Json
 } catch {
-    Write-Warning "Failed to send report: $($_.Exception.Message)"
+    Write-Error "Failed to parse config.json: $($_.Exception.Message)"
+    exit 2
 }
+
+if (-not $config.flowUri -or -not $config.apiKey) {
+    Write-Error "config.json missing required fields 'flowUri' and/or 'apiKey'. Aborting."
+    exit 2
+}
+
+$flowUri = $config.flowUri
+$apiKey  = $config.apiKey
+
+# --- Helper: Extract last N error lines from text ---
+function Get-LastErrorsFromText {
+    param(
+        [Parameter(Mandatory=$true)][Object]$textOrLines,
+        [int]$max = 5
+    )
+    $matches = @()
+    try {
+        $lines = @()
+        if ($textOrLines -is [string]) { $lines = $textOrLines -split "`r?`n" }
+        else { $lines = $textOrLines }
+        $matches = ($lines | Select-String -Pattern $errPattern -AllMatches | ForEach-Object { $_.Line }) | Select-Object -Unique
+        return @($matches | Select-Object -Last $max)
+    } catch {
+        return @()
+    }
+}
+
+# --- Run DISM ---
+Log "Starting DISM /Online /Cleanup-Image /RestoreHealth ..."
+$dismOutput = & dism.ex
